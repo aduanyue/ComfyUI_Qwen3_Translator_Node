@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, __version__ as transformers_version
+from transformers import AutoTokenizer, AutoModelForCausalLM, __version__ as transformers_version, GenerationConfig
 import folder_paths
 import os
 import json
@@ -270,22 +270,17 @@ class Qwen3Translator:
             src_specified = True
             print(f"[Qwen3 Translator] 用户指定源语言: {src}")
 
-        # ----- 构建 prompt（手动使用 Qwen 官方格式） -----
-        # 为了最大兼容性，直接使用原始文本指令，不依赖 apply_chat_template，避免回显问题。
+        # ----- 构建 prompt（使用聊天模板） -----
         if src_specified:
             instruction = f"Translate the following text from {src} into {tgt}. Output ONLY the translation, without any additional comments or labels. Preserve all details and formatting.\n\n{text}"
         else:
             instruction = f"Translate the following text into {tgt}. Output ONLY the translation, without any additional comments or labels. Preserve all details and formatting.\n\n{text}"
 
-        # 构建符合 Qwen 聊天模板的格式（适用于 Qwen2/2.5/3 系列）
-        # 注意：如果模型是 Qwen3，可能使用 <|im_start|> 和 <|im_end|>。
-        # 我们优先尝试 apply_chat_template，如果失败则手工构建。
         try:
             messages = [
                 {"role": "system", "content": "You are a helpful multilingual translation assistant."},
                 {"role": "user", "content": instruction}
             ]
-            # 尝试使用 tokenizer 的 chat template
             prompt = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -294,46 +289,44 @@ class Qwen3Translator:
             print("[Qwen3 Translator] 使用 tokenizer.apply_chat_template 构建 prompt")
         except Exception as e:
             print(f"[Qwen3 Translator] apply_chat_template 失败，使用手工构建: {e}")
-            # 手工构建（适用于常见 Qwen 模型）
-            # 注意：需要知道模型的特殊 token，但一般可以用通用模板
-            # 这里采用更保守的 simple 方式：直接拼接指令
-            prompt = instruction
+            prompt = instruction  # 回退
 
-        # 打印完整 prompt（调试用，截断避免日志过大）
+        # 打印 prompt 信息（调试）
         print(f"[Qwen3 Translator] 生成 prompt 长度: {len(prompt)} 字符")
         if len(prompt) > 500:
             print(f"[Qwen3 Translator] Prompt 预览: {prompt[:200]} ... {prompt[-200:]}")
         else:
             print(f"[Qwen3 Translator] Prompt: {prompt}")
 
-        # ----- 生成 -----
+        # ----- 生成配置 -----
+        # 显式创建 GenerationConfig，避免参数被忽略
+        gen_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0),
+            temperature=temperature if temperature > 0 else None,
+            top_p=0.9 if temperature > 0 else None,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        # 移除 None 值（某些参数不能为 None）
+        if gen_config.temperature is None:
+            gen_config.temperature = 1.0  # 当 do_sample=False 时，temperature 被忽略，但设置一个默认值避免报错
+        if gen_config.top_p is None:
+            gen_config.top_p = 1.0
+
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-
-        # 设置生成参数
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 0,
-            "temperature": temperature if temperature > 0 else None,
-            "top_p": 0.9 if temperature > 0 else None,
-            "pad_token_id": self.tokenizer.eos_token_id,  # 避免 padding 警告
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
-        # 移除 None 值
-        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
-
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                **gen_kwargs
+                generation_config=gen_config,
             )
 
-        # 解码时，从 input_ids 长度之后开始，只取生成部分
+        # 解码：只取生成的新 tokens
         input_len = inputs["input_ids"].shape[1]
         generated_tokens = outputs[0][input_len:]
         if generated_tokens.shape[0] == 0:
-            # 如果生成为空，则整个解码
-            full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print("⚠️ 模型未生成任何新 token，输出整个序列")
+            full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         else:
             full_output = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
             print(f"✅ 模型生成了 {generated_tokens.shape[0]} 个新 token")
@@ -342,8 +335,7 @@ class Qwen3Translator:
 
         # ---------- 提取翻译 ----------
         raw_translation = full_output.strip()
-        # 如果 raw_translation 以 prompt 开头，尝试剥离 prompt（但通常我们只解码生成部分，不会包含 prompt）
-        # 但有些模型可能仍会输出 prompt，做安全处理
+        # 如果 raw_translation 仍然包含 prompt（可能由于解码整个序列导致），尝试剥离
         if prompt in raw_translation:
             raw_translation = raw_translation.split(prompt, 1)[-1].strip()
 
