@@ -191,53 +191,57 @@ class Qwen3Translator:
                 top_p=0.9,
             )
 
-        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"🔵 完整解码结果: {result}")
+        full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(f"🔵 完整解码结果: {full_output}")
 
-        # --- 提取方括号内的翻译 ---
-        matches = re.findall(r'\[([\s\S]*?)\]', result)
-        if len(matches) >= 2:
-            translation = matches[1].strip()
-            if any('\u4e00' <= ch <= '\u9fff' for ch in translation):
-                print(f"🔵 正则提取翻译成功")
-                result = translation
+        # ---------- 改进的提取逻辑（去掉语言检查） ----------
+        translation = None
+
+        # 1. 优先尝试从最外层方括号中解析 JSON 数组
+        bracket_match = re.search(r'(\[[\s\S]*\])', full_output)
+        if bracket_match:
+            json_str = bracket_match.group(1)
+            try:
+                parsed = json.loads(json_str)
+                if isinstance(parsed, list) and parsed:
+                    # 取第一个元素作为翻译
+                    translation = str(parsed[0])
+                    print("🔵 成功解析 JSON 数组，提取第一个元素作为翻译")
+                elif isinstance(parsed, str):
+                    translation = parsed
+                    print("🔵 成功解析 JSON 字符串")
+                else:
+                    print("⚠️ JSON 解析结果不是列表或字符串，尝试回退")
+            except Exception as e:
+                print(f"⚠️ JSON 解析失败: {e}，尝试回退")
+
+        # 2. 如果 JSON 解析失败或未取到有效内容，执行回退提取
+        if translation is None or translation == "":
+            print("⚠️ 未从 JSON 中提取到有效内容，使用回退提取")
+            # 按行分割，尝试找最后一条非空行（通常翻译在最后）
+            lines = [line.strip() for line in full_output.strip().split('\n') if line.strip()]
+            if lines:
+                # 取最后一行（或最后几行？简单起见取最后一行）
+                translation = lines[-1]
+                print(f"🔵 回退提取最后一行作为结果")
             else:
-                print("⚠️ 第二个括号内不是中文，尝试其他提取方法")
-        else:
-            print("⚠️ 未找到足够的方括号对，使用回退提取")
+                translation = full_output  # 保底
 
-        # 回退逻辑：如果提取结果不包含中文，则提取包含中文的最后几行
-        if not any('\u4e00' <= ch <= '\u9fff' for ch in result):
-            print("⚠️ 使用回退提取逻辑")
-            lines = result.strip().split('\n')
-            for i in range(min(10, len(lines)), 0, -1):
-                candidate = "\n".join(lines[-i:]).strip()
-                if any('\u4e00' <= ch <= '\u9fff' for ch in candidate):
-                    result = candidate
-                    print(f"🔵 回退提取包含中文的最后 {i} 行作为结果")
-                    break
-            else:
-                if lines:
-                    result = lines[-1].strip()
-                    print("🔵 回退提取最后一行作为结果")
+        # 3. 清理转义字符（如 \" 和 \n）
+        if translation:
+            try:
+                # 将字符串作为 JSON 字符串解码（处理转义）
+                cleaned = json.loads(f'"{translation}"')
+                if isinstance(cleaned, str):
+                    translation = cleaned
+                    print("🔵 成功解码 JSON 转义字符")
+            except Exception as e:
+                print(f"⚠️ JSON 转义解码失败，使用原始结果: {e}")
 
-        # --- JSON 解码转义字符（如 \" 和 \n）---
-        try:
-            # 将结果作为 JSON 字符串解码（保留实际的换行符和引号）
-            decoded = json.loads(f'"{result}"')
-            if isinstance(decoded, str):
-                result = decoded
-                print("🔵 成功解码 JSON 转义字符")
-        except Exception as e:
-            print(f"⚠️ JSON 解码失败，使用原始结果: {e}")
+            # 4. 最终清理：将换行替换为空格，压缩多余空格
+            translation = translation.replace('\n', ' ')
+            translation = ' '.join(translation.split())
+            translation = translation.strip()
 
-        # --- 最终清理：去除换行符和多余空格 ---
-        # 将所有换行符替换为空格
-        result = result.replace('\n', ' ')
-        # 将多个连续空格压缩为单个空格
-        result = ' '.join(result.split())
-        # 去除首尾空格
-        result = result.strip()
-
-        print(f"🔵 最终返回的结果: {result[:200]}...")
-        return (result,)
+        print(f"🔵 最终返回的结果: {translation[:200] if translation else ''}...")
+        return (translation if translation else "",)
