@@ -221,15 +221,22 @@ class Qwen3Translator:
                     result = lines[-1].strip()
                     print("🔵 回退提取最后一行作为结果")
 
-        # --- 最终清理 ---
-        # 1. 去除首尾空白
-        result = result.strip()
-        # 2. 去除首尾多余的引号（只去除最外层的一对）
-        if result.startswith('"') and result.endswith('"'):
-            result = result[1:-1]
-        elif result.startswith("'") and result.endswith("'"):
-            result = result[1:-1]
-        # 3. 再次去除可能因去除引号而产生的首尾空白
+        # --- JSON 解码转义字符（如 \" 和 \n）---
+        try:
+            # 将结果作为 JSON 字符串解码（保留实际的换行符和引号）
+            decoded = json.loads(f'"{result}"')
+            if isinstance(decoded, str):
+                result = decoded
+                print("🔵 成功解码 JSON 转义字符")
+        except Exception as e:
+            print(f"⚠️ JSON 解码失败，使用原始结果: {e}")
+
+        # --- 最终清理：去除换行符和多余空格 ---
+        # 将所有换行符替换为空格
+        result = result.replace('\n', ' ')
+        # 将多个连续空格压缩为单个空格
+        result = ' '.join(result.split())
+        # 去除首尾空格
         result = result.strip()
 
         print(f"🔵 最终返回的结果: {result[:200]}...")
